@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: '杨琪勇 · 2027 Fall 申请归档台',
-  description: '13 个留学项目的材料、截止日期与推荐信协作看板。',
+  title: '杨琪勇 · 申请工作台',
+  description: '留学申请项目、网申信息与材料文件的本地工作台。',
 };
 
 export default function RootLayout({

@@ -1,164 +1,210 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Archive, ArrowUpRight, BookOpenCheck, CheckCircle2, ChevronRight, CircleDashed, Download, FileCheck2, FileText, FolderLock, GraduationCap, Import, LayoutDashboard, ListFilter, Search, ShieldCheck, Sparkles, Users } from 'lucide-react';
+import { AlertCircle, ArrowUpRight, Check, ChevronRight, ClipboardCheck, Download, Eye, EyeOff, FileArchive, FileText, GraduationCap, Import, KeyRound, Link2, MoreHorizontal, Pencil, Plus, Search, Trash2, Upload } from 'lucide-react';
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
 import { Button, buttonVariants } from '@/components/ui/button';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
-import { Progress } from '@/components/ui/progress';
+import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { commonMaterials, programs, recommenders, statusLabels, type MaterialStatus, type Program } from './data';
+import { Textarea } from '@/components/ui/textarea';
+import { programs as seedPrograms } from './data';
+import { deleteMaterialFile, deleteProjectFiles, getMaterialFile, listMaterialFiles, putMaterialFile, restoreMaterialFile, type StoredMaterialFile } from './workspace-storage';
 
-type View = 'overview' | 'programs' | 'materials' | 'recommenders' | 'guide';
-type SavedState = Record<string, MaterialStatus>;
-const STORAGE_KEY = 'yqy-application-archive-v1';
+type ProjectStatus = 'planning' | 'preparing' | 'ready' | 'submitted' | 'offer';
+type MaterialStatus = 'todo' | 'draft' | 'review' | 'ready' | 'submitted' | 'not-needed';
+type MaterialRecord = { id: string; label: string; requirement: string; owner: string; required: boolean; status: MaterialStatus; fileName?: string; fileType?: string; fileSize?: number; updatedAt?: string };
+type ProjectRecord = { id: string; university: string; program: string; region: string; city: string; round: string; deadline: string; applicationUrl: string; notes: string; status: ProjectStatus; materials: MaterialRecord[] };
+type Credentials = Record<string, { username: string; password: string }>;
+type BackupFile = Omit<StoredMaterialFile, 'blob'> & { dataUrl: string };
 
-const views: { key: View; label: string; icon: typeof Archive }[] = [
-  { key: 'overview', label: '总览', icon: LayoutDashboard },
-  { key: 'programs', label: '13 个项目', icon: GraduationCap },
-  { key: 'materials', label: '通用材料', icon: FolderLock },
-  { key: 'recommenders', label: '推荐信分配', icon: Users },
-  { key: 'guide', label: '协作与隐私', icon: ShieldCheck },
-];
+const WORKSPACE_KEY = 'application-workbench-v2';
+const CREDENTIALS_KEY = 'application-workbench-credentials-v1';
+const projectStatusLabels: Record<ProjectStatus, string> = { planning: '规划中', preparing: '准备材料', ready: '待提交', submitted: '已提交', offer: '已录取' };
+const materialStatusLabels: Record<MaterialStatus, string> = { todo: '待准备', draft: '草稿中', review: '待确认', ready: '已就绪', submitted: '已提交', 'not-needed': '不需要' };
+const statusTone: Record<MaterialStatus, string> = { todo: 'bg-slate-100 text-slate-600', draft: 'bg-amber-50 text-amber-700', review: 'bg-blue-50 text-blue-700', ready: 'bg-emerald-50 text-emerald-700', submitted: 'bg-[#153f36] text-white', 'not-needed': 'bg-white text-slate-400' };
+const newId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
-const statusStyles: Record<MaterialStatus, string> = {
-  ready: 'border-emerald-200 bg-emerald-50 text-emerald-700',
-  progress: 'border-amber-200 bg-amber-50 text-amber-700',
-  todo: 'border-slate-200 bg-slate-50 text-slate-600',
-  na: 'border-slate-200 bg-white text-slate-400',
-};
+const defaultMaterials = (): MaterialRecord[] => [
+  ['CV', '项目定制版 PDF', '共同'],
+  ['Personal Statement / Essay', '按项目题目和字数要求准备', '共同'],
+  ['成绩单', '中英文正式成绩单', '我'],
+  ['推荐信', '按项目要求确认数量与推荐人', '推荐人'],
+  ['语言成绩', 'IELTS / TOEFL 成绩报告', '我'],
+].map(([label, requirement, owner]) => ({ id: newId('mat'), label, requirement, owner, required: true, status: 'todo' }));
 
-const materialId = (programId: string, key: string) => `${programId}:${key}`;
-const getStatus = (state: SavedState, programId: string, key: string, fallback: MaterialStatus) => state[materialId(programId, key)] ?? fallback;
-
-function programProgress(program: Program, state: SavedState) {
-  const applicable = program.materials.filter((item) => getStatus(state, program.id, item.key, item.initialStatus) !== 'na');
-  const ready = applicable.filter((item) => getStatus(state, program.id, item.key, item.initialStatus) === 'ready').length;
-  return applicable.length ? Math.round((ready / applicable.length) * 100) : 0;
+function initialProjects(): ProjectRecord[] {
+  return seedPrograms.map((project) => ({
+    id: project.id, university: project.university, program: project.program, region: project.region, city: project.city, round: project.round, deadline: project.deadlineSort, applicationUrl: project.applicationUrl, notes: project.strategy, status: 'preparing',
+    materials: project.materials.map((material) => ({
+      id: material.key, label: material.label, requirement: material.requirement, owner: material.owner, required: material.initialStatus !== 'na',
+      status: material.initialStatus === 'ready' ? 'ready' : material.initialStatus === 'progress' ? 'draft' : material.initialStatus === 'na' ? 'not-needed' : 'todo',
+    })),
+  }));
 }
 
-function daysUntil(date: string) {
-  const target = new Date(`${date}T23:59:59+08:00`).getTime();
-  const now = new Date('2026-09-01T12:00:00+08:00').getTime();
-  return Math.ceil((target - now) / 86400000);
+function loadProjects() {
+  if (typeof window === 'undefined') return initialProjects();
+  try { const saved = window.localStorage.getItem(WORKSPACE_KEY); return saved ? (JSON.parse(saved) as ProjectRecord[]) : initialProjects(); } catch { return initialProjects(); }
 }
 
-function StatusBadge({ status }: { status: MaterialStatus }) {
-  return <span className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs font-medium ${statusStyles[status]}`}>{status === 'ready' ? <CheckCircle2 className="size-3.5" /> : <CircleDashed className="size-3.5" />}{statusLabels[status]}</span>;
+function formatBytes(value?: number) { if (!value) return ''; if (value < 1024 * 1024) return `${Math.ceil(value / 1024)} KB`; return `${(value / 1024 / 1024).toFixed(1)} MB`; }
+function base64ToBytes(value: string): Uint8Array<ArrayBuffer> { const binary = atob(value); const bytes = new Uint8Array(binary.length); for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index); return bytes; }
+function blobToDataUrl(blob: Blob) { return new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('Unable to read file')); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); }); }
+
+function loadCredentials(): Credentials {
+  if (typeof window === 'undefined') return {};
+  try { return JSON.parse(window.localStorage.getItem(CREDENTIALS_KEY) ?? '{}') as Credentials; } catch { return {}; }
 }
 
 export default function Home() {
-  const [view, setView] = useState<View>('overview');
-  const [selected, setSelected] = useState<Program | null>(null);
+  const [projects, setProjects] = useState<ProjectRecord[]>(loadProjects);
+  const [selectedId, setSelectedId] = useState(() => loadProjects()[0]?.id ?? '');
   const [search, setSearch] = useState('');
-  const [region, setRegion] = useState('全部');
-  const [saved, setSaved] = useState<SavedState>(() => {
-    if (typeof window === 'undefined') return {};
-    try {
-      const value = window.localStorage.getItem(STORAGE_KEY);
-      return value ? JSON.parse(value) : {};
-    } catch {
-      return {};
-    }
-  });
   const [notice, setNotice] = useState('');
+  const [projectDialog, setProjectDialog] = useState<'add' | 'edit' | null>(null);
+  const [materialDialog, setMaterialDialog] = useState(false);
+  const [deleteProjectOpen, setDeleteProjectOpen] = useState(false);
+  const [credentials, setCredentials] = useState<Credentials>(loadCredentials);
+  const [showPassword, setShowPassword] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(saved)); }, [saved]);
+  useEffect(() => { window.localStorage.setItem(WORKSPACE_KEY, JSON.stringify(projects)); }, [projects]);
+  useEffect(() => {
+    type ToolInput = { university?: unknown; program?: unknown; region?: unknown; deadline?: unknown; applicationUrl?: unknown };
+    type ModelContext = { registerTool: (tool: { name: string; title: string; description: string; inputSchema: object; annotations: { readOnlyHint: boolean; untrustedContentHint: boolean }; execute: (input: ToolInput) => Promise<object> }, options: { signal: AbortSignal }) => void | Promise<void> };
+    const context = (document as Document & { modelContext?: ModelContext }).modelContext;
+    if (!context?.registerTool) return;
+    const lifecycle = new AbortController();
+    void Promise.resolve(context.registerTool({
+      name: 'create_application_project',
+      title: '添加申请项目',
+      description: '在当前申请工作台中添加一个院校项目，并创建默认材料清单。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          university: { type: 'string', minLength: 1 },
+          program: { type: 'string', minLength: 1 },
+          region: { type: 'string' },
+          deadline: { type: 'string', description: 'YYYY-MM-DD' },
+          applicationUrl: { type: 'string' },
+        },
+        required: ['university', 'program'],
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: false, untrustedContentHint: false },
+      async execute(input) {
+        if (typeof input.university !== 'string' || !input.university.trim() || typeof input.program !== 'string' || !input.program.trim()) throw new Error('university and program are required');
+        const project: ProjectRecord = { ...blankProject(), university: input.university.trim(), program: input.program.trim(), region: typeof input.region === 'string' ? input.region.trim() : '', deadline: typeof input.deadline === 'string' ? input.deadline : '', applicationUrl: typeof input.applicationUrl === 'string' ? input.applicationUrl : '' };
+        setProjects((current) => [...current, project]);
+        setSelectedId(project.id);
+        setNotice('项目已添加，可以开始整理材料。');
+        return { id: project.id, university: project.university, program: project.program, materialCount: project.materials.length };
+      },
+    }, { signal: lifecycle.signal })).catch(() => undefined);
+    return () => lifecycle.abort();
+  }, []);
+  const selected = projects.find((item) => item.id === selectedId) ?? projects[0];
+  const filtered = useMemo(() => { const query = search.trim().toLowerCase(); return projects.filter((item) => `${item.university} ${item.program} ${item.region}`.toLowerCase().includes(query)); }, [projects, search]);
+  const submitted = projects.filter((item) => item.status === 'submitted').length;
 
-  const filtered = useMemo(() => programs.filter((item) => {
-    const text = `${item.shortName} ${item.university} ${item.program} ${item.city}`.toLowerCase();
-    return (region === '全部' || item.region === region) && text.includes(search.toLowerCase().trim());
-  }), [region, search]);
-  const ordered = useMemo(() => [...programs].sort((a, b) => a.deadlineSort.localeCompare(b.deadlineSort)), []);
-  const verifiedCount = programs.filter((item) => item.verified).length;
-  const overall = Math.round(programs.reduce((sum, item) => sum + programProgress(item, saved), 0) / programs.length);
-  const urgent = ordered.filter((item) => daysUntil(item.deadlineSort) <= 60).slice(0, 4);
+  function updateSelected(update: (project: ProjectRecord) => ProjectRecord) { if (!selected) return; setProjects((current) => current.map((project) => project.id === selected.id ? update(project) : project)); }
+  function saveCredential(username: string, password: string) { if (!selected) return; const next = { ...credentials, [selected.id]: { username, password } }; window.localStorage.setItem(CREDENTIALS_KEY, JSON.stringify(next)); setCredentials(next); setNotice('网申账户名和密码已保存在当前浏览器，不会进入导出文件。'); }
 
-  function setMaterialStatus(programId: string, key: string, status: MaterialStatus) {
-    setSaved((current) => ({ ...current, [materialId(programId, key)]: status }));
-    setNotice('进度已保存在这台设备的浏览器中。');
+  async function exportWorkspace() {
+    try {
+      const files = await listMaterialFiles();
+      const exportedFiles: BackupFile[] = await Promise.all(files.map(async ({ blob, ...file }) => ({ ...file, dataUrl: await blobToDataUrl(blob) })));
+      const payload = { version: 2, exportedAt: new Date().toISOString(), projects, files: exportedFiles, credentialsIncluded: false };
+      const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = `申请工作台备份-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(url); setNotice('工作区已导出；账号密码未包含在备份中。');
+    } catch { setNotice('导出失败，请稍后重试。'); }
   }
 
-  function exportState() {
-    const blob = new Blob([JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), statuses: saved }, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `application-progress-${new Date().toISOString().slice(0, 10)}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-    setNotice('进度 JSON 已导出，可发给协作方导入。');
-  }
-
-  async function importState(file?: File) {
+  async function importWorkspace(file?: File) {
     if (!file) return;
     try {
-      const parsed = JSON.parse(await file.text());
-      setSaved(parsed.statuses ?? parsed);
-      setNotice('进度已导入，并保存在当前浏览器。');
-    } catch {
-      setNotice('导入失败：请选择本系统导出的 JSON 文件。');
-    }
+      const payload = JSON.parse(await file.text()) as { projects: ProjectRecord[]; files?: BackupFile[] };
+      if (!Array.isArray(payload.projects)) throw new Error('Invalid backup');
+      for (const fileRecord of payload.files ?? []) { const [header, content] = fileRecord.dataUrl.split(','); const type = header.match(/data:(.*?);/)?.[1] || fileRecord.type; await restoreMaterialFile({ ...fileRecord, type, blob: new Blob([base64ToBytes(content)], { type }) }); }
+      setProjects(payload.projects); setSelectedId(payload.projects[0]?.id ?? ''); setNotice('工作区及文件已导入当前浏览器。');
+    } catch { setNotice('导入失败，请选择由本工作台导出的 JSON 文件。'); } finally { if (importRef.current) importRef.current.value = ''; }
   }
 
+  async function openFile(material: MaterialRecord) { if (!selected) return; const stored = await getMaterialFile(selected.id, material.id); if (!stored) return setNotice('没有在当前浏览器找到这个文件。'); const url = URL.createObjectURL(stored.blob); window.open(url, '_blank', 'noopener,noreferrer'); window.setTimeout(() => URL.revokeObjectURL(url), 60000); }
+  async function downloadFile(material: MaterialRecord) { if (!selected) return; const stored = await getMaterialFile(selected.id, material.id); if (!stored) return setNotice('没有在当前浏览器找到这个文件。'); const url = URL.createObjectURL(stored.blob); const link = document.createElement('a'); link.href = url; link.download = stored.name; link.click(); URL.revokeObjectURL(url); }
+  async function uploadFile(materialId: string, file?: File) { if (!selected || !file) return; await putMaterialFile(selected.id, materialId, file); updateSelected((project) => ({ ...project, materials: project.materials.map((material) => material.id === materialId ? { ...material, fileName: file.name, fileType: file.type, fileSize: file.size, updatedAt: new Date().toISOString(), status: material.status === 'todo' ? 'review' : material.status } : material) })); setNotice(`${file.name} 已保存在当前浏览器。`); }
+  async function removeFile(materialId: string) { if (!selected) return; await deleteMaterialFile(selected.id, materialId); updateSelected((project) => ({ ...project, materials: project.materials.map((material) => material.id === materialId ? { ...material, fileName: undefined, fileType: undefined, fileSize: undefined, updatedAt: undefined } : material) })); setNotice('文件已从当前浏览器移除。'); }
+  async function removeProject() { if (!selected) return; await deleteProjectFiles(selected.id); const next = projects.filter((project) => project.id !== selected.id); setProjects(next); setSelectedId(next[0]?.id ?? ''); setDeleteProjectOpen(false); setNotice('项目及其本地文件已删除。'); }
+
   return (
-    <main className="min-h-screen bg-[#f5f7f5] text-slate-900">
-      <div className="mx-auto grid min-h-screen max-w-[1500px] lg:grid-cols-[238px_1fr]">
-        <aside className="border-b border-slate-200 bg-[#102a2e] px-5 py-5 text-white lg:sticky lg:top-0 lg:h-screen lg:border-b-0 lg:border-r lg:border-white/10 lg:px-4 lg:py-7">
-          <div className="flex items-center gap-3 px-2"><div className="grid size-10 place-items-center rounded-lg bg-[#d9efdd] text-[#153f36]"><Archive className="size-5" /></div><div><p className="text-[11px] uppercase tracking-[0.18em] text-white/55">2027 Fall</p><h1 className="font-semibold tracking-tight">申请归档台</h1></div></div>
-          <nav className="mt-5 flex gap-1 overflow-x-auto pb-1 lg:mt-9 lg:block lg:space-y-1" aria-label="主导航">
-            {views.map((item) => { const Icon = item.icon; return <button key={item.key} onClick={() => setView(item.key)} className={`flex shrink-0 items-center gap-3 rounded-md px-3 py-2.5 text-sm transition lg:w-full ${view === item.key ? 'bg-white/13 text-white' : 'text-white/66 hover:bg-white/7 hover:text-white'}`}><Icon className="size-4" />{item.label}</button>; })}
+    <main className="min-h-screen bg-[#f3f5f2] text-[#17201d]">
+      <div className="mx-auto min-h-screen max-w-[1540px] lg:grid lg:grid-cols-[310px_1fr]">
+        <aside className="border-b border-[#dfe5df] bg-[#173b35] text-white lg:sticky lg:top-0 lg:h-screen lg:border-b-0 lg:border-r lg:border-white/10">
+          <div className="flex items-center justify-between px-5 py-5 lg:px-6 lg:py-7">
+            <div className="flex items-center gap-3"><div className="grid size-10 place-items-center rounded-xl bg-[#d9efdd] text-[#173b35]"><FileArchive className="size-5" /></div><div><p className="text-[11px] uppercase tracking-[0.18em] text-white/55">2027 Fall</p><h1 className="font-semibold tracking-tight">申请工作台</h1></div></div>
+            <Button size="icon" variant="ghost" className="text-white hover:bg-white/10 hover:text-white" aria-label="添加申请项目" onClick={() => setProjectDialog('add')}><Plus /></Button>
+          </div>
+          <div className="px-4 pb-4 lg:px-5"><div className="relative"><Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-white/40" /><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索院校或专业" className="border-white/10 bg-white/8 pl-9 text-white placeholder:text-white/38" /></div></div>
+          <nav className="flex gap-2 overflow-x-auto px-4 pb-5 lg:block lg:h-[calc(100vh-260px)] lg:space-y-1 lg:overflow-y-auto lg:px-4" aria-label="申请项目">
+            {filtered.map((project) => <button key={project.id} onClick={() => setSelectedId(project.id)} className={`min-w-[230px] rounded-xl px-3 py-3 text-left transition lg:w-full lg:min-w-0 ${selected?.id === project.id ? 'bg-white text-[#173b35]' : 'text-white/72 hover:bg-white/8 hover:text-white'}`}><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-sm font-medium">{project.university}</p><p className={`mt-1 truncate text-xs ${selected?.id === project.id ? 'text-[#52736b]' : 'text-white/46'}`}>{project.program}</p><p className={`mt-2 text-[11px] ${selected?.id === project.id ? 'text-[#52736b]' : 'text-white/42'}`}>{projectStatusLabels[project.status]}</p></div><ChevronRight className="mt-0.5 size-4 shrink-0 opacity-40" /></div></button>)}
+            {!filtered.length && <p className="px-3 py-5 text-sm text-white/50">没有匹配的项目</p>}
           </nav>
-          <div className="mt-7 hidden border-t border-white/10 px-2 pt-6 lg:block"><p className="text-xs text-white/50">当前总进度</p><div className="mt-2 flex items-end justify-between"><span className="text-2xl font-semibold">{overall}%</span><span className="text-xs text-white/45">13 项目</span></div><Progress value={overall} className="mt-3 [&_[data-slot=progress-track]]:bg-white/15 [&_[data-slot=progress-indicator]]:bg-[#9ed6ad]" /><p className="mt-5 text-xs leading-5 text-white/45">材料原件保留在私密云盘；本站只记录状态、要求与私密链接。</p></div>
+          <div className="hidden border-t border-white/10 px-6 py-5 lg:block"><div className="flex items-center justify-between text-xs text-white/50"><span>{projects.length} 个项目</span><span>{submitted} 个已提交</span></div><Button variant="ghost" className="mt-3 w-full justify-start text-white/70 hover:bg-white/8 hover:text-white" onClick={() => setProjectDialog('add')}><Plus /> 添加项目</Button></div>
         </aside>
 
         <section className="min-w-0">
-          <header className="flex flex-col gap-3 border-b border-slate-200 bg-white/85 px-5 py-4 backdrop-blur md:flex-row md:items-center md:justify-between md:px-8"><div><p className="text-xs font-medium text-emerald-700">杨琪勇 · 个人版</p><p className="mt-0.5 text-sm text-slate-500">数据核验至 2026-08-27 · 今日基准 2026-09-01</p></div><div className="flex flex-wrap gap-2"><input aria-label="导入申请进度 JSON" ref={importRef} type="file" accept="application/json" className="hidden" onChange={(event) => importState(event.target.files?.[0])} /><Button variant="outline" onClick={() => importRef.current?.click()}><Import />导入进度</Button><Button variant="outline" onClick={exportState}><Download />导出进度</Button></div></header>
-
-          <div className="px-5 py-7 md:px-8 md:py-9">
-            {notice && <div className="mb-5 flex items-center justify-between border-l-4 border-emerald-500 bg-emerald-50 px-4 py-3 text-sm text-emerald-800"><span>{notice}</span><button onClick={() => setNotice('')} className="text-xs underline underline-offset-4">关闭</button></div>}
-            {view === 'overview' && <Overview urgent={urgent} saved={saved} overall={overall} verifiedCount={verifiedCount} onSelect={setSelected} onShowPrograms={() => setView('programs')} onShowGuide={() => setView('guide')} />}
-            {view === 'programs' && <ProgramsView filtered={filtered} saved={saved} search={search} region={region} onSearch={setSearch} onRegion={setRegion} onSelect={setSelected} />}
-            {view === 'materials' && <MaterialsView />}
-            {view === 'recommenders' && <RecommendersView />}
-            {view === 'guide' && <GuideView />}
+          <header className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dfe5df] bg-white/90 px-5 py-4 backdrop-blur md:px-8"><div><p className="text-sm font-medium">杨琪勇 · 个人申请工作区</p><p className="mt-0.5 text-xs text-slate-500">数据与文件只保存在当前浏览器</p></div><div className="flex flex-wrap gap-2"><input ref={importRef} type="file" accept="application/json" className="hidden" onChange={(event) => importWorkspace(event.target.files?.[0])} /><Button variant="outline" onClick={() => importRef.current?.click()}><Import /> 导入工作区</Button><Button variant="outline" onClick={exportWorkspace}><Download /> 导出工作区</Button><Button onClick={() => setProjectDialog('add')}><Plus /> 添加项目</Button></div></header>
+          <div className="px-5 py-6 md:px-8 md:py-8">
+            {notice && <div className="mb-5 flex items-center justify-between gap-4 border-l-4 border-emerald-500 bg-emerald-50 px-4 py-3 text-sm text-emerald-900"><span>{notice}</span><button className="text-xs underline underline-offset-4" onClick={() => setNotice('')}>关闭</button></div>}
+            {selected ? <ProjectWorkspace key={selected.id} project={selected} credential={credentials[selected.id]} showPassword={showPassword} onShowPassword={setShowPassword} onEdit={() => setProjectDialog('edit')} onDelete={() => setDeleteProjectOpen(true)} onSaveCredential={saveCredential} onStatus={(status) => updateSelected((project) => ({ ...project, status }))} onMaterialStatus={(materialId, status) => updateSelected((project) => ({ ...project, materials: project.materials.map((material) => material.id === materialId ? { ...material, status } : material) }))} onUpload={uploadFile} onOpenFile={openFile} onDownloadFile={downloadFile} onRemoveFile={removeFile} onAddMaterial={() => setMaterialDialog(true)} /> : <div className="grid min-h-[60vh] place-items-center border border-dashed border-slate-300 bg-white p-8 text-center"><div><GraduationCap className="mx-auto size-8 text-emerald-700" /><h2 className="mt-4 text-xl font-semibold">先添加第一个申请项目</h2><p className="mt-2 text-sm text-slate-500">填写院校、专业和网申链接，即可开始整理材料。</p><Button className="mt-5" onClick={() => setProjectDialog('add')}><Plus /> 添加项目</Button></div></div>}
           </div>
         </section>
       </div>
 
-      <ProgramDialog program={selected} saved={saved} onClose={() => setSelected(null)} onStatus={setMaterialStatus} />
+      <ProjectDialog key={`${projectDialog}:${selected?.id ?? 'none'}`} mode={projectDialog} project={projectDialog === 'edit' ? selected : undefined} onClose={() => setProjectDialog(null)} onSave={(project) => { if (projectDialog === 'edit') setProjects((current) => current.map((item) => item.id === project.id ? project : item)); else { setProjects((current) => [...current, project]); setSelectedId(project.id); } setProjectDialog(null); setNotice(projectDialog === 'edit' ? '项目信息已更新。' : '项目已添加，可以开始整理材料。'); }} />
+      <MaterialDialog open={materialDialog} onClose={() => setMaterialDialog(false)} onSave={(material) => { updateSelected((project) => ({ ...project, materials: [...project.materials, material] })); setMaterialDialog(false); setNotice('材料项目已添加。'); }} />
+      <AlertDialog open={deleteProjectOpen} onOpenChange={setDeleteProjectOpen}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>删除这个申请项目？</AlertDialogTitle><AlertDialogDescription>项目信息和当前浏览器中的关联文件都会被删除，此操作无法撤销。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction variant="destructive" onClick={removeProject}>确认删除</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
     </main>
   );
 }
 
-function Overview({ urgent, saved, overall, verifiedCount, onSelect, onShowPrograms, onShowGuide }: { urgent: Program[]; saved: SavedState; overall: number; verifiedCount: number; onSelect: (program: Program) => void; onShowPrograms: () => void; onShowGuide: () => void }) {
-  const stats = [
-    { label: '确认项目', value: '13', note: '英 6 · 美 5 · 新 2', icon: GraduationCap },
-    { label: '2027 官方日期', value: verifiedCount.toString(), note: `${13 - verifiedCount} 个待官网更新`, icon: BookOpenCheck },
-    { label: '整体材料进度', value: `${overall}%`, note: '按浏览器保存状态计算', icon: FileCheck2 },
-    { label: '三封推荐项目', value: '4', note: 'Oxford · Penn · Yale · Cornell', icon: Users },
-  ];
-  return <div className="space-y-7"><div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between"><div><p className="text-sm font-medium text-emerald-700">Good afternoon, Qiyong</p><h2 className="mt-1 text-2xl font-semibold tracking-tight md:text-3xl">先把最近的节点稳稳推进。</h2></div><p className="max-w-xl text-sm leading-6 text-slate-500">当前最优先是 Imperial R1；预计日期会用“待核验”标记，不把上一周期时间误当正式截止。</p></div><div className="grid gap-px overflow-hidden border border-slate-200 bg-slate-200 sm:grid-cols-2 xl:grid-cols-4">{stats.map((item) => <div key={item.label} className="bg-white p-5"><div className="flex items-center justify-between"><p className="text-sm text-slate-500">{item.label}</p><item.icon aria-hidden="true" className="size-4 text-slate-400" /></div><p className="mt-4 text-3xl font-semibold tracking-tight">{item.value}</p><p className="mt-1 text-xs text-slate-400">{item.note}</p></div>)}</div><div className="grid gap-6 xl:grid-cols-[1.55fr_1fr]"><section className="border border-slate-200 bg-white"><div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><div><h3 className="font-semibold">最近 60 天</h3><p className="mt-1 text-xs text-slate-500">按当前规划日期排序</p></div><Button aria-label="查看全部申请项目" variant="ghost" onClick={onShowPrograms}>查看全部 <ChevronRight /></Button></div><div className="divide-y divide-slate-100">{urgent.map((program) => <button aria-label={`查看 ${program.shortName} 项目详情`} key={program.id} onClick={() => onSelect(program)} className="grid w-full gap-3 px-5 py-4 text-left transition hover:bg-slate-50 sm:grid-cols-[54px_1fr_auto] sm:items-center"><div className="text-center"><p className="text-xl font-semibold text-[#1f5b50]">{daysUntil(program.deadlineSort)}</p><p className="text-[10px] uppercase text-slate-400">天</p></div><div><div className="flex flex-wrap items-center gap-2"><p className="font-medium">{program.shortName}</p>{!program.verified && <Badge variant="secondary">待核验</Badge>}</div><p className="mt-1 text-sm text-slate-500">{program.round} · {program.deadline}</p></div><div className="sm:text-right"><p className="text-sm font-medium">{programProgress(program, saved)}%</p><p className="text-xs text-slate-400">材料就绪</p></div></button>)}</div></section><section className="border border-slate-200 bg-white p-5"><div className="flex items-center gap-2"><Sparkles className="size-4 text-amber-500" /><h3 className="font-semibold">本周建议</h3></div><ol className="mt-5 space-y-4">{[['01','锁定 Imperial R1 文书','完成 350 / 500 / 500 词三题初稿与素材核验。'],['02','确认推荐人执行节奏','黄老师定稿；戴老师、杨老师提纲交中介成稿。'],['03','推进 GRE 与 WES','GRE 覆盖 Berkeley / Yale；WES 重点覆盖三个美国项目。']].map(([num,title,body]) => <li key={num} className="grid grid-cols-[30px_1fr] gap-3"><span className="font-mono text-xs text-emerald-700">{num}</span><div><p className="text-sm font-medium">{title}</p><p className="mt-1 text-xs leading-5 text-slate-500">{body}</p></div></li>)}</ol><button aria-label="查看协作与隐私说明" onClick={onShowGuide} className="mt-6 flex w-full items-center justify-between border-t border-slate-100 pt-4 text-sm text-slate-600 hover:text-slate-900"><span>查看协作更新方式</span><ArrowUpRight className="size-4" /></button></section></div></div>;
+function ProjectWorkspace({ project, credential, showPassword, onShowPassword, onEdit, onDelete, onSaveCredential, onStatus, onMaterialStatus, onUpload, onOpenFile, onDownloadFile, onRemoveFile, onAddMaterial }: { project: ProjectRecord; credential?: { username: string; password: string }; showPassword: boolean; onShowPassword: (value: boolean) => void; onEdit: () => void; onDelete: () => void; onSaveCredential: (username: string, password: string) => void; onStatus: (status: ProjectStatus) => void; onMaterialStatus: (materialId: string, status: MaterialStatus) => void; onUpload: (materialId: string, file?: File) => void; onOpenFile: (material: MaterialRecord) => void; onDownloadFile: (material: MaterialRecord) => void; onRemoveFile: (materialId: string) => void; onAddMaterial: () => void }) {
+  const [username, setUsername] = useState(credential?.username ?? ''); const [password, setPassword] = useState(credential?.password ?? '');
+  return <div className="space-y-6">
+    <section className="border border-[#dfe5df] bg-white p-5 md:p-7">
+      <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><Badge variant="secondary">{project.region}{project.city ? ` · ${project.city}` : ''}</Badge><span className="text-sm text-slate-500">{project.round || '暂未填写轮次'}</span></div><h2 className="mt-4 text-2xl font-semibold tracking-tight md:text-3xl">{project.university}</h2><p className="mt-2 text-base text-slate-600">{project.program}</p></div><div className="flex flex-wrap gap-2">{project.applicationUrl && <a className={buttonVariants()} href={project.applicationUrl} target="_blank" rel="noreferrer">打开网申 <ArrowUpRight /></a>}<Button variant="outline" onClick={onEdit}><Pencil /> 编辑</Button><DropdownMenu><DropdownMenuTrigger render={<Button variant="outline" size="icon" aria-label="更多项目操作" />}><MoreHorizontal /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem variant="destructive" onClick={onDelete}><Trash2 /> 删除项目</DropdownMenuItem></DropdownMenuContent></DropdownMenu></div></div>
+      <div className="mt-7 grid gap-px overflow-hidden border border-[#e2e7e2] bg-[#e2e7e2] sm:grid-cols-2"><SummaryCell label="项目状态"><Select value={project.status} onValueChange={(value) => onStatus((value ?? 'preparing') as ProjectStatus)}><SelectTrigger className="mt-2 w-full border-0 bg-transparent px-0 text-base font-semibold shadow-none"><SelectValue /></SelectTrigger><SelectContent>{Object.entries(projectStatusLabels).map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</SelectContent></Select></SummaryCell><SummaryCell label="截止日期"><p className="mt-3 text-lg font-semibold">{project.deadline || '待确认'}</p></SummaryCell></div>
+    </section>
+    <div className="grid gap-6 xl:grid-cols-[1.45fr_0.8fr]">
+      <section className="border border-[#dfe5df] bg-white"><div className="flex items-center justify-between border-b border-slate-100 px-5 py-4 md:px-6"><div><h3 className="font-semibold">申请材料</h3><p className="mt-1 text-xs text-slate-500">上传后保存在本机，可预览、下载或随备份导出</p></div><Button variant="outline" onClick={onAddMaterial}><Plus /> 添加材料</Button></div><div className="divide-y divide-slate-100">{project.materials.map((material) => <MaterialRow key={material.id} material={material} onStatus={(status) => onMaterialStatus(material.id, status)} onUpload={(file) => onUpload(material.id, file)} onOpen={() => onOpenFile(material)} onDownload={() => onDownloadFile(material)} onRemoveFile={() => onRemoveFile(material.id)} />)}{!project.materials.length && <p className="px-6 py-12 text-center text-sm text-slate-500">还没有材料，先添加 CV、PS 或成绩单。</p>}</div></section>
+      <div className="space-y-6">
+        <section className="border border-[#dfe5df] bg-white p-5 md:p-6"><div className="flex items-center justify-between"><div className="flex items-center gap-2"><KeyRound className="size-4 text-emerald-700" /><h3 className="font-semibold">网申账户</h3></div><Badge variant="secondary">仅本机</Badge></div><div className="mt-5 space-y-4"><div><Label htmlFor="portal-user">账户名</Label><Input id="portal-user" className="mt-2" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="邮箱或申请账号" /></div><div><Label htmlFor="portal-password">密码</Label><div className="relative mt-2"><Input id="portal-password" type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} className="pr-10" /><button type="button" className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400" aria-label={showPassword ? '隐藏密码' : '显示密码'} onClick={() => onShowPassword(!showPassword)}>{showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}</button></div></div><Button className="w-full" onClick={() => onSaveCredential(username, password)}><Check /> 保存账户信息</Button><p className="text-xs leading-5 text-slate-500">账户信息直接保存在当前浏览器，不会放进导出的工作区文件。</p></div></section>
+        <section className="border border-[#dfe5df] bg-white p-5 md:p-6"><div className="flex items-center gap-2"><ClipboardCheck className="size-4 text-emerald-700" /><h3 className="font-semibold">项目备注</h3></div><p className="mt-4 whitespace-pre-wrap text-sm leading-6 text-slate-600">{project.notes || '暂无备注。可以在“编辑项目”中记录文书要求、奖学金和下一步。'}</p>{project.applicationUrl && <a className="mt-5 flex items-center gap-2 border-t border-slate-100 pt-4 text-sm text-emerald-700 hover:underline" href={project.applicationUrl} target="_blank" rel="noreferrer"><Link2 className="size-4" />{project.applicationUrl.replace(/^https?:\/\//, '').slice(0, 42)}…</a>}</section>
+        <section className="border-l-4 border-amber-400 bg-amber-50 p-4 text-sm leading-6 text-amber-950"><div className="flex gap-3"><AlertCircle className="mt-1 size-4 shrink-0" /><p><strong>工作区导入导出：</strong>导出会把项目、材料状态和已上传文件一起写入一个 JSON 文件。中介老师导入后可以恢复相同内容；网申账户和密码不会包含。文件越多，JSON 会越大。</p></div></section>
+      </div>
+    </div>
+  </div>;
 }
 
-function ProgramsView({ filtered, saved, search, region, onSearch, onRegion, onSelect }: { filtered: Program[]; saved: SavedState; search: string; region: string; onSearch: (value: string) => void; onRegion: (value: string) => void; onSelect: (program: Program) => void }) {
-  return <div className="space-y-6"><div><h2 className="text-2xl font-semibold tracking-tight">13 个申请项目</h2><p className="mt-1 text-sm text-slate-500">点击项目查看逐项材料；材料状态可直接修改并保存在当前浏览器。</p></div><div className="flex flex-col gap-3 border border-slate-200 bg-white p-3 sm:flex-row"><div className="relative flex-1"><Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-400" /><Input value={search} onChange={(event) => onSearch(event.target.value)} placeholder="搜索院校、专业或城市" className="pl-9" /></div><Select value={region} onValueChange={(value) => onRegion(value ?? '全部')}><SelectTrigger className="w-full sm:w-40"><ListFilter className="size-4" /><SelectValue /></SelectTrigger><SelectContent>{['全部','英国','美国','新加坡'].map((item) => <SelectItem key={item} value={item}>{item}</SelectItem>)}</SelectContent></Select></div><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{filtered.map((program) => { const progress = programProgress(program, saved); return <button key={program.id} onClick={() => onSelect(program)} className="group border border-slate-200 bg-white p-5 text-left transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow-[0_12px_30px_rgba(16,42,46,0.08)]"><div className="flex items-start justify-between gap-4"><span className="font-mono text-xs text-emerald-700">{program.id}</span><span className="text-xs text-slate-400">{program.region} · {program.city}</span></div><h3 className="mt-4 font-semibold leading-5">{program.shortName}</h3><p className="mt-1 min-h-10 text-sm leading-5 text-slate-500">{program.program}</p><div className="mt-5 flex items-center justify-between border-t border-slate-100 pt-4"><div><p className="text-xs text-slate-400">{program.round}</p><p className="mt-1 text-sm font-medium">{program.deadline}</p></div><div className="text-right"><p className="text-sm font-semibold text-emerald-700">{progress}%</p><p className="text-xs text-slate-400">就绪</p></div></div><Progress value={progress} className="mt-3 [&_[data-slot=progress-indicator]]:bg-emerald-600" /></button>; })}</div></div>;
+function SummaryCell({ label, children }: { label: string; children: React.ReactNode }) { return <div className="min-h-28 bg-[#fbfcfa] p-4 md:p-5"><p className="text-xs font-medium text-slate-500">{label}</p>{children}</div>; }
+
+function MaterialRow({ material, onStatus, onUpload, onOpen, onDownload, onRemoveFile }: { material: MaterialRecord; onStatus: (status: MaterialStatus) => void; onUpload: (file?: File) => void; onOpen: () => void; onDownload: () => void; onRemoveFile: () => void }) {
+  return <div className="grid gap-4 px-5 py-5 md:grid-cols-[1fr_150px_auto] md:items-center md:px-6"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><FileText className="size-4 text-emerald-700" /><p className="font-medium">{material.label}</p>{material.required && <span className="text-xs text-rose-600">必需</span>}</div><p className="mt-1 text-sm leading-5 text-slate-500">{material.requirement || '暂无具体要求'}</p><p className="mt-2 text-xs text-slate-400">负责人：{material.owner || '未分配'}</p>{material.fileName && <p className="mt-2 truncate text-xs font-medium text-emerald-700">{material.fileName} · {formatBytes(material.fileSize)}</p>}</div><Select value={material.status} onValueChange={(value) => onStatus((value ?? 'todo') as MaterialStatus)}><SelectTrigger className={`${statusTone[material.status]} border-0 shadow-none`}><SelectValue /></SelectTrigger><SelectContent>{Object.entries(materialStatusLabels).map(([value, label]) => <SelectItem key={value} value={value}>{label}</SelectItem>)}</SelectContent></Select><div className="flex flex-wrap gap-2 md:justify-end">{material.fileName ? <><Button size="icon" variant="outline" aria-label={`预览 ${material.fileName}`} onClick={onOpen}><Eye /></Button><Button size="icon" variant="outline" aria-label={`下载 ${material.fileName}`} onClick={onDownload}><Download /></Button><DropdownMenu><DropdownMenuTrigger render={<Button size="icon" variant="outline" aria-label="更多文件操作" />}><MoreHorizontal /></DropdownMenuTrigger><DropdownMenuContent align="end"><label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-slate-100"><Upload className="size-4" />替换文件<input type="file" className="hidden" onChange={(event) => onUpload(event.target.files?.[0])} /></label><DropdownMenuItem variant="destructive" onClick={onRemoveFile}><Trash2 />移除文件</DropdownMenuItem></DropdownMenuContent></DropdownMenu></> : <label className={buttonVariants({ variant: 'outline' })}><Upload /> 上传<input type="file" className="hidden" onChange={(event) => onUpload(event.target.files?.[0])} /></label>}</div></div>;
 }
 
-function MaterialsView() {
-  return <div className="space-y-6"><div><h2 className="text-2xl font-semibold tracking-tight">通用材料库</h2><p className="mt-1 text-sm text-slate-500">这里只显示文件类别与私密目录，不展示或上传原件。</p></div><div className="overflow-x-auto border border-slate-200 bg-white"><table className="w-full min-w-[760px] text-left text-sm"><thead className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500"><tr><th className="px-5 py-3 font-medium">材料</th><th className="px-5 py-3 font-medium">当前状态</th><th className="px-5 py-3 font-medium">建议位置</th><th className="px-5 py-3 font-medium">下一动作</th></tr></thead><tbody className="divide-y divide-slate-100">{commonMaterials.map((item) => <tr key={item.name}><td className="px-5 py-4 font-medium">{item.name}</td><td className="px-5 py-4"><StatusBadge status={item.status} /></td><td className="px-5 py-4 text-slate-500">{item.location}</td><td className="px-5 py-4 text-slate-500">{item.action}</td></tr>)}</tbody></table></div><div className="border-l-4 border-amber-400 bg-amber-50 p-4 text-sm leading-6 text-amber-900"><strong>文件原则：</strong>原始件只读，editable 与 submitted 分开；提交版禁止覆盖；申请号、付款凭证、护照、成绩单和推荐信绝不进入公开仓库。</div></div>;
+function ProjectDialog({ mode, project, onClose, onSave }: { mode: 'add' | 'edit' | null; project?: ProjectRecord; onClose: () => void; onSave: (project: ProjectRecord) => void }) {
+  const [form, setForm] = useState<ProjectRecord>(() => project ?? blankProject());
+  return <Dialog open={Boolean(mode)} onOpenChange={(open) => !open && onClose()}><DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"><DialogHeader><DialogTitle>{mode === 'edit' ? '编辑申请项目' : '添加申请项目'}</DialogTitle><DialogDescription>填写基础信息后即可开始上传和跟踪材料。</DialogDescription></DialogHeader><div className="grid gap-4 py-2 sm:grid-cols-2"><FormField label="学校" id="university"><Input id="university" value={form.university} onChange={(event) => setForm({ ...form, university: event.target.value })} placeholder="Nanyang Technological University" /></FormField><FormField label="专业" id="program"><Input id="program" value={form.program} onChange={(event) => setForm({ ...form, program: event.target.value })} placeholder="MSc Business Analytics" /></FormField><FormField label="国家或地区" id="region"><Input id="region" value={form.region} onChange={(event) => setForm({ ...form, region: event.target.value })} placeholder="新加坡" /></FormField><FormField label="城市" id="city"><Input id="city" value={form.city} onChange={(event) => setForm({ ...form, city: event.target.value })} placeholder="Singapore" /></FormField><FormField label="申请轮次" id="round"><Input id="round" value={form.round} onChange={(event) => setForm({ ...form, round: event.target.value })} placeholder="Round 1" /></FormField><FormField label="截止日期" id="deadline"><Input id="deadline" type="date" value={form.deadline} onChange={(event) => setForm({ ...form, deadline: event.target.value })} /></FormField><FormField label="网申网站" id="application-url" className="sm:col-span-2"><Input id="application-url" type="url" value={form.applicationUrl} onChange={(event) => setForm({ ...form, applicationUrl: event.target.value })} placeholder="https://..." /></FormField><FormField label="项目备注" id="notes" className="sm:col-span-2"><Textarea id="notes" value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="记录文书要求、奖学金、推荐信数量或下一步" rows={4} /></FormField></div><DialogFooter><Button variant="outline" onClick={onClose}>取消</Button><Button disabled={!form.university.trim() || !form.program.trim()} onClick={() => onSave(form)}><Check /> 保存项目</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function RecommendersView() {
-  return <div className="space-y-6"><div><h2 className="text-2xl font-semibold tracking-tight">推荐信分配</h2><p className="mt-1 text-sm text-slate-500">三位老师侧重点互补，避免重复叙述同一段经历。</p></div><div className="grid gap-4 lg:grid-cols-3">{recommenders.map((person) => <article key={person.name} className="border border-slate-200 bg-white p-5"><div className="flex items-start justify-between"><div className="grid size-10 place-items-center bg-emerald-50 font-semibold text-emerald-700">{person.name.slice(0, 1)}</div><Badge variant="secondary">{person.role}</Badge></div><h3 className="mt-5 text-lg font-semibold">{person.name}</h3><p className="mt-1 text-sm text-emerald-700">{person.status}</p><dl className="mt-5 space-y-4 border-t border-slate-100 pt-4 text-sm"><div><dt className="text-xs text-slate-400">叙事重点</dt><dd className="mt-1 leading-5 text-slate-600">{person.focus}</dd></div><div><dt className="text-xs text-slate-400">建议覆盖</dt><dd className="mt-1 leading-5 text-slate-600">{person.suggested}</dd></div></dl></article>)}</div><div className="border border-slate-200 bg-white p-5"><h3 className="font-semibold">数量规则</h3><div className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><div className="bg-slate-50 p-4"><p className="text-slate-400">0 封</p><p className="mt-2 font-medium">NUS DSS</p></div><div className="bg-slate-50 p-4"><p className="text-slate-400">1–2 封</p><p className="mt-2 font-medium">UCL、Edinburgh、JHU；其余多数 2 封</p></div><div className="bg-emerald-50 p-4"><p className="text-emerald-700">3 封</p><p className="mt-2 font-medium">Oxford、Penn、Yale、Cornell</p></div></div></div></div>;
+function blankProject(): ProjectRecord { return { id: newId('project'), university: '', program: '', region: '', city: '', round: '', deadline: '', applicationUrl: '', notes: '', status: 'planning', materials: defaultMaterials() }; }
+
+function MaterialDialog({ open, onClose, onSave }: { open: boolean; onClose: () => void; onSave: (material: MaterialRecord) => void }) {
+  const [label, setLabel] = useState(''); const [requirement, setRequirement] = useState(''); const [owner, setOwner] = useState('共同');
+  return <Dialog open={open} onOpenChange={(value) => !value && onClose()}><DialogContent><DialogHeader><DialogTitle>添加申请材料</DialogTitle><DialogDescription>可以添加作品集、奖学金 Essay、WES、视频面试等项目特有材料。</DialogDescription></DialogHeader><div className="space-y-4 py-2"><FormField label="材料名称" id="material-label"><Input id="material-label" value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Scholarship Essay" /></FormField><FormField label="具体要求" id="material-requirement"><Textarea id="material-requirement" value={requirement} onChange={(event) => setRequirement(event.target.value)} placeholder="最多 400 词，与主申请同时提交" /></FormField><FormField label="负责人" id="material-owner"><Input id="material-owner" value={owner} onChange={(event) => setOwner(event.target.value)} /></FormField></div><DialogFooter><Button variant="outline" onClick={onClose}>取消</Button><Button disabled={!label.trim()} onClick={() => onSave({ id: newId('mat'), label, requirement, owner, required: true, status: 'todo' })}><Plus /> 添加</Button></DialogFooter></DialogContent></Dialog>;
 }
 
-function GuideView() {
-  return <div className="space-y-6"><div><h2 className="text-2xl font-semibold tracking-tight">协作与隐私边界</h2><p className="mt-1 text-sm text-slate-500">第一版是可共享查看的静态站，不是假装成有后端的多人系统。</p></div><div className="grid gap-4 lg:grid-cols-2"><article className="border border-slate-200 bg-white p-6"><FolderLock className="size-5 text-emerald-700" /><h3 className="mt-4 font-semibold">文件放在哪里</h3><p className="mt-2 text-sm leading-6 text-slate-500">敏感原件放私密云盘或本地受控目录；页面只放文件名、状态、负责人和私密分享链接。GitHub 仓库不保存任何护照、成绩单、推荐信或申请号。</p></article><article className="border border-slate-200 bg-white p-6"><Users className="size-5 text-emerald-700" /><h3 className="mt-4 font-semibold">如何共同更新</h3><p className="mt-2 text-sm leading-6 text-slate-500">当前状态默认只在每个人自己的浏览器里。更新后导出 JSON 发给对方导入，或由你修改单一数据文件并提交。下一阶段可接入 Supabase / Airtable 实现账号与实时同步。</p></article></div><div className="border border-slate-200 bg-white"><div className="border-b border-slate-100 px-5 py-4"><h3 className="font-semibold">建议目录</h3></div><div className="grid gap-px bg-slate-100 sm:grid-cols-2">{['00_admin / 项目元数据与截止日期','01_profile / CV 与通用经历库','02_academic / 成绩、排名、在读证明','03_tests / IELTS、GRE、送分记录','04_recommendations / 推荐人 brief','05_projects / 每项目文书与提交版','06_scholarships / 奖学金材料','07_submissions / 回执与 portal 截图','99_archive / 历史版本'].map((item) => <div key={item} className="bg-white px-5 py-3 font-mono text-xs text-slate-600">{item}</div>)}</div></div><div className="border-l-4 border-emerald-500 bg-emerald-50 p-5"><h3 className="font-semibold text-emerald-900">后续通用版路线</h3><p className="mt-2 text-sm leading-6 text-emerald-900/75">把“项目类型”扩展为留学、保研、奖学金三类；共用材料主档、截止日期、负责人、版本与提交回执；再增加权限、评论和变更记录。个人版跑顺后再抽象，不急着一次做大。</p></div></div>;
-}
-
-function ProgramDialog({ program, saved, onClose, onStatus }: { program: Program | null; saved: SavedState; onClose: () => void; onStatus: (programId: string, key: string, status: MaterialStatus) => void }) {
-  return <Dialog open={!!program} onOpenChange={(open) => !open && onClose()}>{program && <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl"><DialogHeader><div className="flex items-center gap-2"><Badge variant="secondary">{program.id}</Badge><Badge variant={program.verified ? 'default' : 'outline'}>{program.verified ? '2027 官方' : '预计 / 待更新'}</Badge></div><DialogTitle className="mt-2 text-xl">{program.university}</DialogTitle><DialogDescription>{program.program} · {program.city}</DialogDescription></DialogHeader><div className="grid gap-4 border-y border-slate-100 py-4 sm:grid-cols-2"><div><p className="text-xs text-slate-400">当前策略节点</p><p className="mt-1 text-sm font-medium">{program.round} · {program.deadline}</p></div><div><p className="text-xs text-slate-400">奖学金机制</p><p className="mt-1 text-sm font-medium">{program.scholarshipMode}</p></div><div className="sm:col-span-2"><p className="text-xs text-slate-400">申请策略</p><p className="mt-1 text-sm leading-6 text-slate-600">{program.strategy}</p></div></div><div><div className="mb-3 flex items-center justify-between"><h4 className="font-semibold">材料清单</h4><span className="text-sm font-medium text-emerald-700">{programProgress(program, saved)}% 就绪</span></div><div className="space-y-2">{program.materials.map((item) => { const current = getStatus(saved, program.id, item.key, item.initialStatus); return <div key={item.key} className="grid gap-3 border border-slate-100 p-3 sm:grid-cols-[1fr_116px] sm:items-center"><div><div className="flex flex-wrap items-center gap-2"><p className="text-sm font-medium">{item.label}</p><span className="text-[11px] text-slate-400">负责人：{item.owner}</span></div><p className="mt-1 text-xs leading-5 text-slate-500">{item.requirement}</p></div><Select value={current} onValueChange={(value) => onStatus(program.id, item.key, value as MaterialStatus)}><SelectTrigger className="w-full"><SelectValue /></SelectTrigger><SelectContent>{(['ready','progress','todo','na'] as MaterialStatus[]).map((status) => <SelectItem key={status} value={status}>{statusLabels[status]}</SelectItem>)}</SelectContent></Select></div>; })}</div></div><div className="flex flex-wrap gap-2"><a className={buttonVariants()} href={program.applicationUrl} target="_blank" rel="noreferrer"><ArrowUpRight />申请官网</a><a className={buttonVariants({ variant: 'outline' })} href={program.scholarshipUrl} target="_blank" rel="noreferrer"><FileText />奖学金官网</a></div></DialogContent>}</Dialog>;
-}
+function FormField({ label, id, className = '', children }: { label: string; id: string; className?: string; children: React.ReactNode }) { return <div className={className}><Label htmlFor={id}>{label}</Label><div className="mt-2">{children}</div></div>; }
